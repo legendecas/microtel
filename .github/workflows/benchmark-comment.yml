@@ -1,0 +1,85 @@
+name: Benchmark comment
+
+# Posts the results of a pull request's Benchmark run as a comment,
+# updating the earlier comment if there is one.
+#
+# This has to be its own workflow. Benchmark runs on pull_request, where
+# pull requests from forks get a read-only GITHUB_TOKEN that a job's
+# permissions can't raise, so a comment job there would fail. Moving
+# Benchmark to pull_request_target would give it a write token, but it
+# runs the pull request's code, which GitHub advises against on that
+# trigger (cache poisoning, write and secret access). See
+# https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows
+#
+# workflow_run runs this file and the comparison script from the default
+# branch, with a write token, so it only reads data from the pull
+# request's artifact and never runs its code.
+on:
+  workflow_run:
+    workflows: [Benchmark]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: latest
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-results
+          path: results
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Post or update the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          pr=$(cat results/pr-number)
+          if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
+            echo "Invalid pull request number: $pr"
+            exit 1
+          fi
+          # The artifact comes from pull request code, so only trust the
+          # number if that pull request's head is the commit benchmarked.
+          # A newer push fails this check and its own run comments instead.
+          pr_head=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          if [ "$pr_head" != "$HEAD_SHA" ]; then
+            echo "Pull request #$pr head $pr_head is not $HEAD_SHA, skipping"
+            exit 0
+          fi
+          base_sha=$(cat results/base-sha)
+          if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid base commit: $base_sha"
+            exit 1
+          fi
+
+          marker='<!-- microtel-benchmark -->'
+          {
+            echo "$marker"
+            echo "## Benchmark results"
+            echo
+            echo "Comparing $HEAD_SHA against main at $base_sha ([run]($RUN_URL))."
+            echo
+            node scripts/compare-benchmarks.js results/base.ndjson results/head.ndjson
+          } > body.md
+
+          comment=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$comment" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment" -F body=@body.md
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/comments" -F body=@body.md
+          fi

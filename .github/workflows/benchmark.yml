@@ -1,0 +1,59 @@
+name: Benchmark
+
+# Pushes run the benchmarks as a check. Pull requests also run them on
+# the base commit, in the same job so both sets share one machine, and
+# upload the results for the Benchmark comment workflow to post. This
+# workflow has a read-only token on pull requests from forks, so it
+# can't comment itself.
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: head
+      - uses: actions/setup-node@v7
+        with:
+          node-version: latest
+
+      - if: github.event_name != 'pull_request'
+        working-directory: head
+        run: npm run bench
+
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - if: github.event_name == 'pull_request'
+        name: Run the benchmarks on the base and the pull request
+        run: |
+          mkdir results
+          echo '${{ github.event.pull_request.number }}' > results/pr-number
+          echo '${{ github.event.pull_request.base.sha }}' > results/base-sha
+          for tree in base head; do
+            (cd "$tree" && node --experimental-bench --bench --bench-reporter=json \
+              --bench-reporter-destination="../results/$tree.ndjson" 'benchmark/*.bench.js')
+          done
+      - if: github.event_name == 'pull_request'
+        run: node head/scripts/compare-benchmarks.js results/base.ndjson results/head.ndjson >> "$GITHUB_STEP_SUMMARY"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results
+          path: results/
+          retention-days: 7
